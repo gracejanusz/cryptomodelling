@@ -10,6 +10,7 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # -----------------------------
 # Dataset utilities
@@ -31,6 +32,8 @@ def make_sequences(features_np, target_np, seq_len: int):
     for i in range(seq_len, len(features_np)):
         X.append(features_np[i - seq_len:i, :])
         y.append(target_np[i])  # predict value at time i (next after the window)
+    if len(X) == 0:
+        return np.empty((0, seq_len, features_np.shape[1])), np.empty((0, 1))
     return np.stack(X), np.array(y).reshape(-1, 1)
 
 # -----------------------------
@@ -49,42 +52,53 @@ class LSTMForecaster(nn.Module):
         self.fc = nn.Linear(hidden_size, 1)
 
     def forward(self, x):
-        # x: [B, T, F]
-        out, _ = self.lstm(x)        # out: [B, T, H]
-        last = out[:, -1, :]         # [B, H]
-        return self.fc(last)         # [B, 1]
+        out, _ = self.lstm(x)   # [B, T, H]
+        last = out[:, -1, :]    # [B, H]
+        return self.fc(last)    # [B, 1]
 
 # -----------------------------
 # Cleaning Data
 # -----------------------------
-
 def load_and_clean(csv_path):
+    """
+    Cleans CSVs of the form:
+    "Date","Price","Open","High","Low","Vol.","Change %"
+    with commas in numbers, K/M suffixes in volume, and trailing percent signs.
+    """
     df = pd.read_csv(csv_path)
 
-    # Remove commas and convert numeric cols
+    # numeric with commas
     for col in ["Price", "Open", "High", "Low"]:
-        df[col] = df[col].str.replace(",", "").astype(float)
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.replace(",", "", regex=False).astype(float)
 
-    # Volume: convert "43.00K" → 43000, "1.2M" → 1,200,000
-    def parse_vol(x):
-        if isinstance(x, str):
-            x = x.replace(",", "")
-            if "K" in x:
-                return float(x.replace("K", "")) * 1e3
-            elif "M" in x:
-                return float(x.replace("M", "")) * 1e6
-            else:
-                return float(x)
-        return float(x)
+    # volume: 43.00K -> 43000, 1.2M -> 1200000
+    if "Vol." in df.columns:
+        def parse_vol(x):
+            s = str(x).replace(",", "")
+            if s.endswith("K"):
+                return float(s[:-1]) * 1e3
+            if s.endswith("M"):
+                return float(s[:-1]) * 1e6
+            try:
+                return float(s)
+            except ValueError:
+                return np.nan
+        df["Vol."] = df["Vol."].apply(parse_vol)
 
-    df["Vol."] = df["Vol."].apply(parse_vol)
+    # change %: "-1.57%" -> -1.57
+    if "Change %" in df.columns:
+        df["Change %"] = (
+            df["Change %"].astype(str)
+            .str.replace("%", "", regex=False)
+            .str.replace(",", "", regex=False)
+        )
+        df["Change %"] = pd.to_numeric(df["Change %"], errors="coerce")
 
-    # Change %: strip %
-    df["Change %"] = df["Change %"].str.replace("%", "").astype(float)
-
-    # Date to datetime, ascending order
-    df["Date"] = pd.to_datetime(df["Date"], format="%m/%d/%Y")
-    df = df.sort_values("Date").reset_index(drop=True)
+    # date asc
+    if "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"], format="%m/%d/%Y", errors="coerce")
+        df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
 
     return df
 
@@ -118,13 +132,12 @@ def evaluate(model, loader, device, criterion):
         epoch_loss += loss.item() * Xb.size(0)
         preds.append(pred.cpu().numpy())
         trues.append(yb.cpu().numpy())
-    preds = np.vstack(preds)
-    trues = np.vstack(trues)
-    return epoch_loss / len(loader.dataset), preds, trues
+    preds = np.vstack(preds) if preds else np.empty((0, 1))
+    trues = np.vstack(trues) if trues else np.empty((0, 1))
+    return epoch_loss / max(len(loader.dataset), 1), preds, trues
 
 def inv_transform(arr_2d, scaler):
-    """Inverse-transform a 2D target array using a fitted scaler (works for MinMax or Standard)."""
-    # The scaler was fit on y (n,1), so transform expects 2D
+    """Inverse-transform a 2D target array using a fitted scaler."""
     return scaler.inverse_transform(arr_2d)
 
 def mape(y_true, y_pred):
@@ -138,7 +151,7 @@ def mape(y_true, y_pred):
 # -----------------------------
 def main():
     parser = argparse.ArgumentParser(description="LSTM RNN for cryptocurrency forecasting (PyTorch)")
-    parser.add_argument("--csv", type=str, required=True, help="Path to CSV with at least Date and Close columns.")
+    parser.add_argument("--csv", type=str, required=True, help="Path to CSV with at least a Date and target column.")
     parser.add_argument("--date-col", type=str, default="Date", help="Date column name.")
     parser.add_argument("--symbol", type=str, default=None, help="Filter by this symbol if CSV has multiple coins.")
     parser.add_argument("--target", type=str, default="Close", help="Target column to forecast.")
@@ -151,17 +164,21 @@ def main():
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--train-split", type=float, default=0.8, help="Fraction of time-ordered data for training.")
+    parser.add_argument("--train-split", type=float, default=0.8,
+                        help="Fraction for time-based split (ignored if --test-start and --test-end are provided).")
     parser.add_argument("--normalize", choices=["standard", "minmax"], default="standard")
     parser.add_argument("--shuffle-train", action="store_true", help="Shuffle batches inside training split.")
+    parser.add_argument("--test-start", type=str, default=None, help="Force test window start date (MM/DD/YYYY).")
+    parser.add_argument("--test-end", type=str, default=None, help="Force test window end date (MM/DD/YYYY).")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Load CSV
+    # Load & clean CSV
     df = load_and_clean(args.csv)
-    # Basic cleaning
+
+    # Basic checks
     if args.date_col not in df.columns:
         raise ValueError(f"Date column '{args.date_col}' not found in CSV.")
     df[args.date_col] = pd.to_datetime(df[args.date_col], errors="coerce")
@@ -174,12 +191,12 @@ def main():
         if df.empty:
             raise ValueError(f"No rows found for symbol '{args.symbol}'.")
 
+    # Default feature candidates (supports both "Vol." and "Volume")
+    default_candidates = ["Open", "High", "Low", "Close", "Price", "Vol.", "Volume", "Change %"]
+
     # Select features
-    default_candidates = ["Open", "High", "Low", "Close", "Volume"]
     if args.features is None:
-        features = [c for c in default_candidates if c in df.columns]
-        if args.target not in features and args.target in df.columns:
-            features.append(args.target)
+        features = [c for c in default_candidates if c in df.columns and c != args.target]
         if not features:
             raise ValueError("No feature columns found. Provide --features explicitly.")
     else:
@@ -191,20 +208,62 @@ def main():
     if args.target not in df.columns:
         raise ValueError(f"Target column '{args.target}' not found in CSV.")
 
-    # Keep only necessary columns
+    # Keep only necessary columns (ensure target is present even if not in features)
     keep_cols = [args.date_col] + features
+    if args.target not in keep_cols:
+        keep_cols.append(args.target)
     df = df[keep_cols].dropna().reset_index(drop=True)
 
-    # Split by time
-    n = len(df)
-    if n < args.seq_len + 5:
-        raise ValueError(f"Not enough rows ({n}) for seq-len={args.seq_len}.")
-    split_idx = int(n * args.train_split)
-    split_idx = max(split_idx, args.seq_len + 1)  # ensure at least one training sequence
-    train_df = df.iloc[:split_idx].copy()
-    test_df  = df.iloc[split_idx:].copy()
+    # -----------------------------
+    # Deterministic date-based split (if provided)
+    # -----------------------------
+    test_start_dt = None
+    test_end_dt = None
+    if args.test_start and args.test_end:
+        try:
+            test_start_dt = pd.to_datetime(args.test_start, format="%m/%d/%Y")
+            test_end_dt = pd.to_datetime(args.test_end, format="%m/%d/%Y")
+        except Exception as e:
+            raise ValueError(f"Could not parse --test-start/--test-end: {e}")
 
-    # Scale features & target with training-only fit
+        if test_end_dt < test_start_dt:
+            raise ValueError("--test-end must be on/after --test-start")
+
+        # Train: strictly before test_start; Test: between start and end inclusive
+        train_df = df[df[args.date_col] < test_start_dt].copy()
+        test_df  = df[(df[args.date_col] >= test_start_dt) & (df[args.date_col] <= test_end_dt)].copy()
+
+        if test_df.empty:
+            raise ValueError("Selected test window has 0 rows. Check dates or CSV.")
+        if train_df.empty:
+            raise ValueError("No training rows before test window. Extend your data or move the window backward.")
+
+        # Save the exact test window rows used (cleaned)
+        start_tag = test_start_dt.strftime("%Y%m%d")
+        end_tag = test_end_dt.strftime("%Y%m%d")
+        test_window_path = Path(f"test_window_{start_tag}_to_{end_tag}.csv")
+        test_df.to_csv(test_window_path, index=False)
+        print(f"Saved test window rows to {test_window_path.resolve()}")
+    else:
+        # -----------------------------
+        # Original time-based split by fraction
+        # -----------------------------
+        n = len(df)
+        if n < args.seq_len + 5:
+            raise ValueError(f"Not enough rows ({n}) for seq-len={args.seq_len}.")
+
+        split_idx = int(n * args.train_split)
+        min_seq_rows = args.seq_len + 1
+        split_idx = max(split_idx, min_seq_rows)  # training must have at least one sequence
+        if n - split_idx < min_seq_rows:          # test must have at least one sequence
+            split_idx = max(n - min_seq_rows, min_seq_rows)
+
+        train_df = df.iloc[:split_idx].copy()
+        test_df  = df.iloc[split_idx:].copy()
+
+    # -----------------------------
+    # Scaling (fit on train only)
+    # -----------------------------
     if args.normalize == "standard":
         feat_scaler = StandardScaler()
         tgt_scaler = StandardScaler()
@@ -222,10 +281,39 @@ def main():
     X_test_scaled = feat_scaler.transform(X_test_feat)
     y_test_scaled = tgt_scaler.transform(y_test)
 
-    # Build sequences
+    # -----------------------------
+    # Sequences
+    # -----------------------------
+    # Train sequences within train block
     Xtr_seq, ytr = make_sequences(X_train_scaled, y_train_scaled, seq_len=args.seq_len)
-    # Important: the test sequences must be built only within the test block to avoid leakage
-    Xte_seq, yte = make_sequences(X_test_scaled, y_test_scaled, seq_len=args.seq_len)
+
+    # Test sequences **across the boundary**:
+    # prepend last seq_len training rows as context so we can predict every test day
+    if len(X_train_scaled) < args.seq_len:
+        raise ValueError(
+            f"Training split has only {len(X_train_scaled)} rows; need at least seq-len={args.seq_len} "
+            "so the model can use train context to predict the first test day."
+        )
+
+    X_context = np.vstack([X_train_scaled[-args.seq_len:], X_test_scaled])
+    y_context = np.vstack([y_train_scaled[-args.seq_len:], y_test_scaled])
+
+    Xte_all, yte_all = make_sequences(X_context, y_context, seq_len=args.seq_len)
+
+    # Keep exactly one sequence per test row (targets all lie in the test set)
+    if len(Xte_all) >= len(test_df):
+        Xte_seq, yte = Xte_all[-len(test_df):], yte_all[-len(test_df):]
+    else:
+        # Shouldn't happen, but guard anyway
+        Xte_seq, yte = Xte_all, yte_all
+
+    # Safety check
+    if len(Xtr_seq) == 0 or len(Xte_seq) == 0:
+        raise ValueError(
+            f"After splitting and sequencing, got "
+            f"{len(Xtr_seq)} train sequences and {len(Xte_seq)} test sequences. "
+            f"Try a smaller --seq-len (e.g., 7) or adjust the test window."
+        )
 
     train_ds = CryptoDataset(Xtr_seq, ytr)
     test_ds  = CryptoDataset(Xte_seq, yte)
@@ -263,40 +351,55 @@ def main():
     y_pred = inv_transform(y_pred_scaled, tgt_scaler).reshape(-1)
     y_true = inv_transform(y_true_scaled, tgt_scaler).reshape(-1)
 
-    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
-    mae = np.mean(np.abs(y_true - y_pred))
-    mape_val = mape(y_true, y_pred)
+    rmse = np.sqrt(np.mean((y_true - y_pred) ** 2)) if len(y_true) else float("nan")
+    mae = np.mean(np.abs(y_true - y_pred)) if len(y_true) else float("nan")
+    mape_val = mape(y_true, y_pred) if len(y_true) else float("nan")
 
     print("\nTest set performance (original scale):")
     print(f"RMSE: {rmse:.4f}")
     print(f"MAE : {mae:.4f}")
     print(f"MAPE: {mape_val:.2f}%")
 
-    # Build a date index for test predictions (align to the end of each test window)
-    # Test_df length = Tt; after making sequences, we lose first seq_len rows.
-    test_dates = test_df[args.date_col].iloc[args.seq_len:].reset_index(drop=True)
+    # One date per test prediction
+    test_dates = test_df[args.date_col].reset_index(drop=True)
     out = pd.DataFrame({
         args.date_col: test_dates,
         "y_true": y_true,
         "y_pred": y_pred,
     })
+
+    # Name outputs; if forced window was used, include it in filenames
     out_path = Path("predictions.csv")
+    fig_path = Path("pred_vs_actual.png")
+    if test_start_dt is not None and test_end_dt is not None:
+        tag = f"{test_start_dt.strftime('%Y%m%d')}_to_{test_end_dt.strftime('%Y%m%d')}"
+        out_path = Path(f"predictions_{tag}.csv")
+        fig_path = Path(f"pred_vs_actual_{tag}.png")
+
     out.to_csv(out_path, index=False)
     print(f"\nSaved predictions to {out_path.resolve()}")
 
-    # Plot
+    # Plot (markers + tight daily ticks so short windows show up)
     plt.figure(figsize=(10, 5))
-    plt.plot(out[args.date_col], out["y_true"], label="Actual")
-    plt.plot(out[args.date_col], out["y_pred"], label="Predicted")
-    plt.title("LSTM Forecast (Test Period)")
+    plt.plot(out[args.date_col], out["y_true"], marker="o", label="Actual")
+    plt.plot(out[args.date_col], out["y_pred"], marker="o", label="Predicted")
+    ax = plt.gca()
+    ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%m/%d"))
+    plt.xticks(rotation=45)
+    plt.xlim(out[args.date_col].min(), out[args.date_col].max())
+    title_extra = ""
+    if test_start_dt is not None and test_end_dt is not None:
+        title_extra = f" [{test_start_dt.strftime('%m/%d/%Y')} - {test_end_dt.strftime('%m/%d/%Y')}]"
+    plt.title(f"LSTM Forecast (Test Period){title_extra}")
     plt.xlabel("Date")
     plt.ylabel(args.target)
     plt.legend()
     plt.tight_layout()
-    fig_path = Path("pred_vs_actual.png")
     plt.savefig(fig_path, dpi=150)
     print(f"Saved plot to {fig_path.resolve()}")
 
+    # Save model & scalers metadata
     model_path = Path("lstm_crypto.pt")
     torch.save({
         "state_dict": model.state_dict(),
