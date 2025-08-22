@@ -1,5 +1,8 @@
 # README — Tweet Volume vs. Crypto Performance
 
+
+![Bitcoin Graph](image.png)
+
 This project extends an LSTM price forecaster with a simple question:
 **Do days with more tweets mentioning a cryptocurrency correspond to different market performance on those days (or the days after)?**
 
