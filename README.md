@@ -8,6 +8,8 @@ This project extends an LSTM price forecaster with a simple question:
 
 Below is the plan, data flow, and reproducible steps to fetch tweet counts, align them with daily OHLCV data, and quantify the relationship.
 
+[Check out gracejanusz.com to see more updates](https://gracejanusz.com)
+
 ---
 
 ## Objectives
